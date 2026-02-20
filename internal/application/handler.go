@@ -15,6 +15,8 @@ type DB interface {
 	FindOrCreateUser(ctx context.Context, telegramID int64) (*domain.User, error)
 	FindAvailableSlots(ctx context.Context) ([]domain.AvailabilitySlot, error)
 	BookSlot(ctx context.Context, recruiterID, slotID int) (*domain.Booking, error)
+	AddAvailabilitySlot(ctx context.Context, start, end time.Time) (*domain.AvailabilitySlot, error)
+	DeleteAvailabilitySlot(ctx context.Context, slotID int) error
 }
 
 // LLM defines the LLM operations needed by the handler.
@@ -50,6 +52,12 @@ func NewHandler(db DB, llm LLM, telegram Telegram, candidateTelegramID int64) *H
 func (h *Handler) HandleMessage(ctx context.Context, msg *domain.TelegramMessage) {
 	log := slog.With("telegram_id", msg.From.ID, "chat_id", msg.Chat.ID)
 
+	// Admin commands from the bot owner.
+	if msg.From.ID == h.candidateTelegramID && strings.HasPrefix(msg.Text, "/") {
+		h.handleAdminCommand(ctx, msg)
+		return
+	}
+
 	user, err := h.db.FindOrCreateUser(ctx, msg.From.ID)
 	if err != nil {
 		log.Error("FindOrCreateUser failed", "err", err)
@@ -80,6 +88,101 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *domain.TelegramMessage
 	if sendErr := h.telegram.SendMessage(ctx, msg.Chat.ID, reply); sendErr != nil {
 		log.Error("SendMessage failed", "err", sendErr)
 	}
+}
+
+// handleAdminCommand processes commands sent by the bot owner.
+func (h *Handler) handleAdminCommand(ctx context.Context, msg *domain.TelegramMessage) {
+	parts := strings.Fields(msg.Text)
+	if len(parts) == 0 {
+		return
+	}
+	switch parts[0] {
+	case "/addslot":
+		h.handleAddSlot(ctx, msg, parts[1:])
+	case "/deleteslot":
+		h.handleDeleteSlot(ctx, msg, parts[1:])
+	case "/listslots":
+		h.handleListSlots(ctx, msg)
+	default:
+		reply := "Unknown admin command. Use /addslot, /deleteslot <id>, or /listslots."
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, reply)
+	}
+}
+
+// handleAddSlot adds an availability slot.
+// Usage: /addslot 2006-01-02 15:04 2006-01-02 15:04 (UTC)
+func (h *Handler) handleAddSlot(ctx context.Context, msg *domain.TelegramMessage, args []string) {
+	const layout = "2006-01-02 15:04"
+	if len(args) != 4 {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID,
+			"Usage: /addslot YYYY-MM-DD HH:MM YYYY-MM-DD HH:MM (UTC)")
+		return
+	}
+	startStr := args[0] + " " + args[1]
+	endStr := args[2] + " " + args[3]
+	start, err := time.Parse(layout, startStr)
+	if err != nil {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID,
+			fmt.Sprintf("Invalid start time %q: %v", startStr, err))
+		return
+	}
+	end, err := time.Parse(layout, endStr)
+	if err != nil {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID,
+			fmt.Sprintf("Invalid end time %q: %v", endStr, err))
+		return
+	}
+	if !end.After(start) {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "End time must be after start time.")
+		return
+	}
+	slot, err := h.db.AddAvailabilitySlot(ctx, start.UTC(), end.UTC())
+	if err != nil {
+		slog.Error("AddAvailabilitySlot failed", "err", err)
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "Failed to add slot: "+err.Error())
+		return
+	}
+	_ = h.telegram.SendMessage(ctx, msg.Chat.ID,
+		fmt.Sprintf("✅ Slot #%d added: %s – %s UTC",
+			slot.ID,
+			slot.StartTime.UTC().Format("Mon Jan 2, 2006 15:04"),
+			slot.EndTime.UTC().Format("15:04"),
+		))
+}
+
+// handleDeleteSlot removes an availability slot by ID.
+// Usage: /deleteslot <id>
+func (h *Handler) handleDeleteSlot(ctx context.Context, msg *domain.TelegramMessage, args []string) {
+	if len(args) != 1 {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "Usage: /deleteslot <id>")
+		return
+	}
+	var slotID int
+	if _, err := fmt.Sscanf(args[0], "%d", &slotID); err != nil {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "Invalid slot ID: "+args[0])
+		return
+	}
+	if err := h.db.DeleteAvailabilitySlot(ctx, slotID); err != nil {
+		slog.Error("DeleteAvailabilitySlot failed", "err", err)
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "Failed to delete slot: "+err.Error())
+		return
+	}
+	_ = h.telegram.SendMessage(ctx, msg.Chat.ID, fmt.Sprintf("✅ Slot #%d deleted.", slotID))
+}
+
+// handleListSlots lists all available (unbooked) slots for the admin.
+func (h *Handler) handleListSlots(ctx context.Context, msg *domain.TelegramMessage) {
+	slots, err := h.db.FindAvailableSlots(ctx)
+	if err != nil {
+		slog.Error("FindAvailableSlots failed", "err", err)
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "Failed to list slots: "+err.Error())
+		return
+	}
+	if len(slots) == 0 {
+		_ = h.telegram.SendMessage(ctx, msg.Chat.ID, "No available slots.")
+		return
+	}
+	_ = h.telegram.SendMessage(ctx, msg.Chat.ID, formatSlots(slots))
 }
 
 // shouldEscalate returns true when the intent requires escalation.

@@ -107,7 +107,31 @@ func (db *DB) FindAvailableSlots(ctx context.Context) ([]domain.AvailabilitySlot
 	return slots, rows.Err()
 }
 
-// BookSlot atomically books an availability slot for a recruiter.
+// AddAvailabilitySlot inserts a new availability slot.
+func (db *DB) AddAvailabilitySlot(ctx context.Context, start, end time.Time) (*domain.AvailabilitySlot, error) {
+	s := &domain.AvailabilitySlot{}
+	err := db.pool.QueryRow(ctx, `
+		INSERT INTO availability (start_time, end_time)
+		VALUES ($1, $2)
+		RETURNING id, start_time, end_time
+	`, start, end).Scan(&s.ID, &s.StartTime, &s.EndTime)
+	if err != nil {
+		return nil, fmt.Errorf("AddAvailabilitySlot: %w", err)
+	}
+	return s, nil
+}
+
+// DeleteAvailabilitySlot removes an availability slot by ID.
+func (db *DB) DeleteAvailabilitySlot(ctx context.Context, slotID int) error {
+	tag, err := db.pool.Exec(ctx, `DELETE FROM availability WHERE id = $1`, slotID)
+	if err != nil {
+		return fmt.Errorf("DeleteAvailabilitySlot: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("slot %d not found", slotID)
+	}
+	return nil
+}
 // Returns the booking, or (nil, nil) if the slot is already taken (idempotent).
 func (db *DB) BookSlot(ctx context.Context, recruiterID, slotID int) (*domain.Booking, error) {
 	tx, err := db.pool.Begin(ctx)
