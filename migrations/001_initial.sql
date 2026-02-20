@@ -3,8 +3,8 @@
 CREATE TABLE IF NOT EXISTS users (
   id serial primary key,
   telegram_id bigint unique not null,
-  company text,
-  role text,
+  company text not null default '',
+  role text not null default '',
   created_at timestamp not null default now()
 );
 

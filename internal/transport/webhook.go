@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/genaforvena/ilya_bot/internal/domain"
 )
@@ -58,7 +59,9 @@ func (wh *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	msg := update.Message
 	go func() {
-		wh.handler.HandleMessage(context.Background(), msg)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		wh.handler.HandleMessage(ctx, msg)
 	}()
 }
 
