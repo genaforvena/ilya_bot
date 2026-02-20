@@ -34,6 +34,10 @@ func main() {
 	llm := infrastructure.NewLLMClient(cfg.deepSeekAPIKey, cfg.llmEnabled)
 
 	appHandler := application.NewHandler(db, llm, tg, cfg.candidateTelegramID)
+	if cfg.embeddingEnabled && cfg.embeddingAPIKey != "" {
+		embedder := infrastructure.NewEmbeddingClient(cfg.embeddingAPIKey, cfg.embeddingBaseURL, cfg.embeddingModel)
+		appHandler.WithEmbedder(embedder, cfg.similarityThreshold)
+	}
 	webhookHandler := transport.NewWebhookHandler(cfg.telegramSecret, appHandler)
 
 	mux := http.NewServeMux()
@@ -78,16 +82,26 @@ type config struct {
 	candidateTelegramID int64
 	llmEnabled          bool
 	port                string
+	embeddingEnabled    bool
+	embeddingAPIKey     string
+	embeddingBaseURL    string
+	embeddingModel      string
+	similarityThreshold float64
 }
 
 func loadConfig() config {
 	cfg := config{
-		telegramToken:  mustEnv("TELEGRAM_BOT_TOKEN"),
-		telegramSecret: getEnv("TELEGRAM_SECRET", ""),
-		databaseURL:    mustEnv("DATABASE_URL"),
-		deepSeekAPIKey:  getEnv("DEEPSEA_API_KEY", ""),
-		llmEnabled:     getEnvBool("LLM_ENABLED", true),
-		port:           getEnv("PORT", "8080"),
+		telegramToken:       mustEnv("TELEGRAM_BOT_TOKEN"),
+		telegramSecret:      getEnv("TELEGRAM_SECRET", ""),
+		databaseURL:         mustEnv("DATABASE_URL"),
+		deepSeekAPIKey:      getEnv("DEEPSEA_API_KEY", ""),
+		llmEnabled:          getEnvBool("LLM_ENABLED", true),
+		port:                getEnv("PORT", "8080"),
+		embeddingEnabled:    getEnvBool("EMBEDDING_ENABLED", false),
+		embeddingAPIKey:     getEnv("EMBEDDING_API_KEY", getEnv("DEEPSEA_API_KEY", "")),
+		embeddingBaseURL:    getEnv("EMBEDDING_BASE_URL", ""),
+		embeddingModel:      getEnv("EMBEDDING_MODEL", ""),
+		similarityThreshold: getEnvFloat("SIMILARITY_THRESHOLD", 0.85),
 	}
 
 	candidateIDStr := mustEnv("CANDIDATE_TELEGRAM_ID")
@@ -126,4 +140,16 @@ func getEnvBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
 }

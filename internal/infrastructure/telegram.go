@@ -34,33 +34,45 @@ type sendMessageRequest struct {
 	ParseMode string `json:"parse_mode,omitempty"`
 }
 
-// SendMessage sends a text message to the given chat ID.
-func (c *TelegramClient) SendMessage(ctx context.Context, chatID int64, text string) error {
+type sendMessageResponse struct {
+	OK     bool `json:"ok"`
+	Result struct {
+		MessageID int `json:"message_id"`
+	} `json:"result"`
+}
+
+// SendMessage sends a text message and returns the Telegram message_id.
+func (c *TelegramClient) SendMessage(ctx context.Context, chatID int64, text string) (int, error) {
 	payload := sendMessageRequest{
 		ChatID: chatID,
 		Text:   text,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal sendMessage: %w", err)
+		return 0, fmt.Errorf("marshal sendMessage: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/bot%s/sendMessage", telegramBaseURL, c.token)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("create sendMessage request: %w", err)
+		return 0, fmt.Errorf("create sendMessage request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("sendMessage HTTP: %w", err)
+		return 0, fmt.Errorf("sendMessage HTTP: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		slog.Error("telegram sendMessage non-200", "status", resp.StatusCode, "chat_id", chatID)
-		return fmt.Errorf("telegram API returned status %d", resp.StatusCode)
+		return 0, fmt.Errorf("telegram API returned status %d", resp.StatusCode)
 	}
-	return nil
+
+	var tgResp sendMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
+		return 0, fmt.Errorf("decode sendMessage response: %w", err)
+	}
+	return tgResp.Result.MessageID, nil
 }
