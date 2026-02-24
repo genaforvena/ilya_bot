@@ -178,11 +178,16 @@ func (h *Handler) handleAdminReply(ctx context.Context, msg *domain.TelegramMess
 			slog.Warn("embed question failed", "err", embErr)
 		}
 	}
-	if err := h.db.StoreLearnedAnswer(ctx, esc.QuestionText, msg.Text, embedding); err != nil {
-		slog.Error("StoreLearnedAnswer failed", "err", err)
+	storeErr := h.db.StoreLearnedAnswer(ctx, esc.QuestionText, msg.Text, embedding)
+	if storeErr != nil {
+		slog.Error("StoreLearnedAnswer failed", "err", storeErr)
 	}
 
-	if _, err := h.telegram.SendMessage(ctx, h.candidateTelegramID, "✅ Reply forwarded and answer stored."); err != nil {
+	ackText := "✅ Reply forwarded and answer stored."
+	if storeErr != nil {
+		ackText = "✅ Reply forwarded, but failed to store the answer for learning."
+	}
+	if _, err := h.telegram.SendMessage(ctx, h.candidateTelegramID, ackText); err != nil {
 		slog.Error("admin ack failed", "err", err)
 	}
 }

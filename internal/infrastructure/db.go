@@ -2,6 +2,7 @@ package infrastructure
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/genaforvena/ilya_bot/internal/domain"
@@ -16,7 +18,8 @@ import (
 
 // DB wraps a pgxpool.Pool for database operations.
 type DB struct {
-	pool *pgxpool.Pool
+	pool      *pgxpool.Pool
+	hasVector bool // true when pgvector extension is available
 }
 
 // NewDB creates a new DB from a connection string and runs schema migration.
@@ -86,24 +89,51 @@ func (db *DB) migrate(ctx context.Context) error {
 	}
 
 	// pgvector extension + learned_answers (optional; bot still works without it).
+	hasVector := true
 	if _, extErr := db.pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS vector`); extErr != nil {
-		slog.Warn("pgvector extension not available, similarity search disabled"+
-			" – install pgvector on PostgreSQL to enable it (https://github.com/pgvector/pgvector#installation)",
-			"err", extErr)
-		return nil
+		var pgErr *pgconn.PgError
+		if errors.As(extErr, &pgErr) && pgErr.Code == "58P01" {
+			// 58P01 = undefined_file: pgvector shared library is not installed on the server.
+			slog.Warn("pgvector extension is not installed, similarity search disabled"+
+				" – install pgvector on PostgreSQL to enable it (https://github.com/pgvector/pgvector#installation)")
+		} else {
+			slog.Warn("failed to enable pgvector extension, similarity search disabled"+
+				" – check PostgreSQL permissions or connectivity",
+				"err", extErr)
+		}
+		hasVector = false
 	}
-	if _, err = db.pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS learned_answers (
-			id serial primary key,
-			question_text text not null,
-			answer_text text not null,
-			embedding vector(1536),
-			created_at timestamp not null default now()
-		);
-		CREATE INDEX IF NOT EXISTS learned_answers_embedding_idx
-			ON learned_answers USING hnsw (embedding vector_cosine_ops);
-	`); err != nil {
-		slog.Warn("failed to create learned_answers table", "err", err)
+	db.hasVector = hasVector
+
+	// learned_answers is always created, but with the vector column only when pgvector is available.
+	// Note: if pgvector is later installed, a manual migration is required to add the embedding column
+	// and HNSW index to the existing learned_answers table.
+	if hasVector {
+		if _, err = db.pool.Exec(ctx, `
+			CREATE TABLE IF NOT EXISTS learned_answers (
+				id serial primary key,
+				question_text text not null,
+				answer_text text not null,
+				embedding vector(1536),
+				created_at timestamp not null default now()
+			);
+			CREATE INDEX IF NOT EXISTS learned_answers_embedding_idx
+				ON learned_answers USING hnsw (embedding vector_cosine_ops);
+		`); err != nil {
+			slog.Warn("failed to create learned_answers table with vector support", "err", err)
+		}
+	} else {
+		// Fallback schema without vector column; allows storing answers even when pgvector is unavailable.
+		if _, err = db.pool.Exec(ctx, `
+			CREATE TABLE IF NOT EXISTS learned_answers (
+				id serial primary key,
+				question_text text not null,
+				answer_text text not null,
+				created_at timestamp not null default now()
+			);
+		`); err != nil {
+			slog.Warn("failed to create learned_answers table without vector support", "err", err)
+		}
 	}
 	return nil
 }
@@ -279,7 +309,7 @@ func (db *DB) ResolveEscalation(ctx context.Context, id int) error {
 // StoreLearnedAnswer saves an admin-approved Q&A pair with an optional embedding.
 func (db *DB) StoreLearnedAnswer(ctx context.Context, questionText, answerText string, embedding []float32) error {
 	var err error
-	if len(embedding) > 0 {
+	if db.hasVector && len(embedding) > 0 {
 		_, err = db.pool.Exec(ctx, `
 			INSERT INTO learned_answers (question_text, answer_text, embedding)
 			VALUES ($1, $2, $3::vector)
@@ -298,8 +328,9 @@ func (db *DB) StoreLearnedAnswer(ctx context.Context, questionText, answerText s
 
 // FindSimilarAnswer returns the most similar learned answer whose cosine similarity
 // to the given embedding is at or above threshold, or (nil, nil) if none qualifies.
+// Returns (nil, nil) immediately when pgvector is unavailable.
 func (db *DB) FindSimilarAnswer(ctx context.Context, embedding []float32, threshold float64) (*domain.LearnedAnswer, error) {
-	if len(embedding) == 0 {
+	if !db.hasVector || len(embedding) == 0 {
 		return nil, nil
 	}
 	a := &domain.LearnedAnswer{}

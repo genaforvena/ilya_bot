@@ -13,17 +13,32 @@ CREATE TABLE IF NOT EXISTS escalations (
 
 CREATE INDEX IF NOT EXISTS escalations_admin_msg_id_idx ON escalations(admin_msg_id);
 
--- pgvector extension + learned answers table (requires pgvector to be installed).
-CREATE EXTENSION IF NOT EXISTS vector;
+-- pgvector-backed learned answers table.
+-- If pgvector is not installed on the server, skip creating the learned_answers
+-- table and its index, but still allow the rest of the migration to succeed.
+DO $$
+BEGIN
+  BEGIN
+    -- Try to create or ensure the pgvector extension exists.
+    CREATE EXTENSION IF NOT EXISTS vector;
+  EXCEPTION
+    WHEN undefined_file THEN
+      -- pgvector is not available on this server; skip learned_answers objects.
+      RAISE NOTICE 'pgvector extension is not available; skipping learned_answers table and index creation.';
+      RETURN;
+  END;
 
-CREATE TABLE IF NOT EXISTS learned_answers (
-  id serial primary key,
-  question_text text not null,
-  answer_text text not null,
-  embedding vector(1536),
-  created_at timestamp not null default now()
-);
+  -- pgvector is available: create the learned_answers table.
+  CREATE TABLE IF NOT EXISTS learned_answers (
+    id serial primary key,
+    question_text text not null,
+    answer_text text not null,
+    embedding vector(1536),
+    created_at timestamp not null default now()
+  );
 
--- HNSW index for fast approximate cosine-similarity search.
-CREATE INDEX IF NOT EXISTS learned_answers_embedding_idx
-  ON learned_answers USING hnsw (embedding vector_cosine_ops);
+  -- HNSW index for fast approximate cosine-similarity search.
+  CREATE INDEX IF NOT EXISTS learned_answers_embedding_idx
+    ON learned_answers USING hnsw (embedding vector_cosine_ops);
+END;
+$$;

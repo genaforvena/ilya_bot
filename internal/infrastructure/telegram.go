@@ -35,8 +35,10 @@ type sendMessageRequest struct {
 }
 
 type sendMessageResponse struct {
-	OK     bool `json:"ok"`
-	Result struct {
+	OK          bool   `json:"ok"`
+	Description string `json:"description"`
+	ErrorCode   int    `json:"error_code"`
+	Result      struct {
 		MessageID int `json:"message_id"`
 	} `json:"result"`
 }
@@ -73,6 +75,9 @@ func (c *TelegramClient) SendMessage(ctx context.Context, chatID int64, text str
 	var tgResp sendMessageResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tgResp); err != nil {
 		return 0, fmt.Errorf("decode sendMessage response: %w", err)
+	}
+	if !tgResp.OK {
+		return 0, fmt.Errorf("telegram API error %d: %s", tgResp.ErrorCode, tgResp.Description)
 	}
 	return tgResp.Result.MessageID, nil
 }
