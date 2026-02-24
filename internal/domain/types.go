@@ -8,13 +8,19 @@ type TelegramUpdate struct {
 	Message  *TelegramMessage `json:"message"`
 }
 
+// TelegramReplyToMessage holds minimal info about the replied-to message.
+type TelegramReplyToMessage struct {
+	MessageID int `json:"message_id"`
+}
+
 // TelegramMessage represents a Telegram message.
 type TelegramMessage struct {
-	MessageID int            `json:"message_id"`
-	From      *TelegramUser  `json:"from"`
-	Chat      TelegramChat   `json:"chat"`
-	Text      string         `json:"text"`
-	Date      int64          `json:"date"`
+	MessageID      int                     `json:"message_id"`
+	From           *TelegramUser           `json:"from"`
+	Chat           TelegramChat            `json:"chat"`
+	Text           string                  `json:"text"`
+	Date           int64                   `json:"date"`
+	ReplyToMessage *TelegramReplyToMessage `json:"reply_to_message"`
 }
 
 // TelegramUser represents a Telegram user.
@@ -77,6 +83,26 @@ const (
 	IntentSmalltalk = "smalltalk"
 	IntentUnknown   = "unknown"
 )
+
+// Escalation represents a pending recruiter-question escalation forwarded to admin.
+type Escalation struct {
+	ID             int
+	RecruiterChatID int64
+	QuestionText   string
+	AdminMsgID     int
+	Reason         string
+	Status         string
+	CreatedAt      time.Time
+	ResolvedAt     *time.Time
+}
+
+// LearnedAnswer is an admin-approved Q&A pair stored for future auto-answering.
+type LearnedAnswer struct {
+	ID           int
+	QuestionText string
+	AnswerText   string
+	CreatedAt    time.Time
+}
 
 // TopicSensitive returns true if the topic requires escalation.
 func TopicSensitive(topic *string) bool {

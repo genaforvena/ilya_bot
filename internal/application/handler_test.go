@@ -14,10 +14,13 @@ import (
 // --- Mocks ---
 
 type mockDB struct {
-	users    []domain.User
-	slots    []domain.AvailabilitySlot
-	booked   map[int]bool
-	nextSlotID int
+	users          []domain.User
+	slots          []domain.AvailabilitySlot
+	booked         map[int]bool
+	nextSlotID     int
+	escalations    []domain.Escalation
+	learnedAnswers []domain.LearnedAnswer
+	similarAnswer  *domain.LearnedAnswer
 }
 
 func (m *mockDB) FindOrCreateUser(_ context.Context, telegramID int64) (*domain.User, error) {
@@ -66,6 +69,53 @@ func (m *mockDB) DeleteAvailabilitySlot(_ context.Context, slotID int) error {
 	return fmt.Errorf("slot %d not found", slotID)
 }
 
+func (m *mockDB) StoreEscalation(_ context.Context, recruiterChatID int64, questionText string, adminMsgID int, reason string) (*domain.Escalation, error) {
+	e := domain.Escalation{
+		ID:              len(m.escalations) + 1,
+		RecruiterChatID: recruiterChatID,
+		QuestionText:    questionText,
+		AdminMsgID:      adminMsgID,
+		Reason:          reason,
+		Status:          "pending",
+		CreatedAt:       time.Now(),
+	}
+	m.escalations = append(m.escalations, e)
+	return &e, nil
+}
+
+func (m *mockDB) FindEscalationByAdminMsgID(_ context.Context, adminMsgID int) (*domain.Escalation, error) {
+	for i := range m.escalations {
+		if m.escalations[i].AdminMsgID == adminMsgID && m.escalations[i].Status == "pending" {
+			return &m.escalations[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func (m *mockDB) ResolveEscalation(_ context.Context, id int) error {
+	for i := range m.escalations {
+		if m.escalations[i].ID == id {
+			m.escalations[i].Status = "resolved"
+			return nil
+		}
+	}
+	return fmt.Errorf("escalation %d not found", id)
+}
+
+func (m *mockDB) StoreLearnedAnswer(_ context.Context, questionText, answerText string, _ []float32) error {
+	m.learnedAnswers = append(m.learnedAnswers, domain.LearnedAnswer{
+		ID:           len(m.learnedAnswers) + 1,
+		QuestionText: questionText,
+		AnswerText:   answerText,
+		CreatedAt:    time.Now(),
+	})
+	return nil
+}
+
+func (m *mockDB) FindSimilarAnswer(_ context.Context, _ []float32, _ float64) (*domain.LearnedAnswer, error) {
+	return m.similarAnswer, nil
+}
+
 func (m *mockDB) slotByID(id int) domain.AvailabilitySlot {
 	for _, s := range m.slots {
 		if s.ID == id {
@@ -94,14 +144,25 @@ type mockTG struct {
 		chatID int64
 		text   string
 	}
+	nextMsgID int
 }
 
-func (m *mockTG) SendMessage(_ context.Context, chatID int64, text string) error {
+func (m *mockTG) SendMessage(_ context.Context, chatID int64, text string) (int, error) {
 	m.sent = append(m.sent, struct {
 		chatID int64
 		text   string
 	}{chatID, text})
-	return nil
+	m.nextMsgID++
+	return m.nextMsgID, nil
+}
+
+type mockEmbedder struct {
+	embedding []float32
+	err       error
+}
+
+func (m *mockEmbedder) Embed(_ context.Context, _ string) ([]float32, error) {
+	return m.embedding, m.err
 }
 
 // --- Tests ---
@@ -378,5 +439,156 @@ func TestAdminCommand_NonAdminCannotUseAdminCommands(t *testing.T) {
 
 	if len(db.slots) != 0 {
 		t.Error("non-admin should not be able to add slots")
+	}
+}
+
+// --- Escalation and learning tests ---
+
+// TestEscalation_StoresRecord verifies that escalate() persists a record in the DB.
+func TestEscalation_StoresRecord(t *testing.T) {
+	db := &mockDB{booked: map[int]bool{}}
+	llm := &mockLLM{intent: &domain.Intent{Intent: "unknown", Confidence: 0.3}}
+	tg := &mockTG{}
+	h := application.NewHandler(db, llm, tg, 999)
+
+	msg := &domain.TelegramMessage{
+		From: &domain.TelegramUser{ID: 1},
+		Chat: domain.TelegramChat{ID: 42},
+		Text: "What is the salary range?",
+	}
+	h.HandleMessage(context.Background(), msg)
+
+	if len(db.escalations) != 1 {
+		t.Fatalf("expected 1 escalation record, got %d", len(db.escalations))
+	}
+	if db.escalations[0].RecruiterChatID != 42 {
+		t.Errorf("expected recruiter chat 42, got %d", db.escalations[0].RecruiterChatID)
+	}
+	if db.escalations[0].AdminMsgID != 1 {
+		t.Errorf("expected admin msg id 1 (first SendMessage), got %d", db.escalations[0].AdminMsgID)
+	}
+	if db.escalations[0].QuestionText != "What is the salary range?" {
+		t.Errorf("unexpected question text: %s", db.escalations[0].QuestionText)
+	}
+}
+
+// TestHandleAdminReply_ForwardsAndStoresLearned verifies the admin reply flow:
+// admin replies to a forwarded escalation → recruiter gets the reply → learned answer stored.
+func TestHandleAdminReply_ForwardsAndStoresLearned(t *testing.T) {
+	db := &mockDB{booked: map[int]bool{}}
+	llm := &mockLLM{intent: &domain.Intent{Intent: "smalltalk", Confidence: 0.9}}
+	tg := &mockTG{}
+	h := application.NewHandler(db, llm, tg, adminID)
+
+	// Pre-populate an escalation as if it had been created during a previous request.
+	db.escalations = []domain.Escalation{
+		{
+			ID:              1,
+			RecruiterChatID: 42,
+			QuestionText:    "What is the salary range?",
+			AdminMsgID:      100,
+			Status:          "pending",
+			CreatedAt:       time.Now(),
+		},
+	}
+
+	// Admin replies to msg 100.
+	adminReply := &domain.TelegramMessage{
+		MessageID: 200,
+		From:      &domain.TelegramUser{ID: adminID},
+		Chat:      domain.TelegramChat{ID: adminID},
+		Text:      "The salary is competitive, around 150k–180k.",
+		ReplyToMessage: &domain.TelegramReplyToMessage{MessageID: 100},
+	}
+	h.HandleMessage(context.Background(), adminReply)
+
+	// First sent message: reply forwarded to recruiter (chat 42).
+	if len(tg.sent) < 2 {
+		t.Fatalf("expected at least 2 messages, got %d", len(tg.sent))
+	}
+	if tg.sent[0].chatID != 42 {
+		t.Errorf("expected first message to recruiter (42), got chatID=%d", tg.sent[0].chatID)
+	}
+	if tg.sent[0].text != "The salary is competitive, around 150k–180k." {
+		t.Errorf("unexpected reply text: %s", tg.sent[0].text)
+	}
+
+	// Escalation should be resolved.
+	if db.escalations[0].Status != "resolved" {
+		t.Errorf("escalation should be resolved, got %s", db.escalations[0].Status)
+	}
+
+	// A learned answer should have been stored.
+	if len(db.learnedAnswers) != 1 {
+		t.Fatalf("expected 1 learned answer, got %d", len(db.learnedAnswers))
+	}
+	if db.learnedAnswers[0].AnswerText != "The salary is competitive, around 150k–180k." {
+		t.Errorf("unexpected learned answer: %s", db.learnedAnswers[0].AnswerText)
+	}
+}
+
+// TestHandleMessage_AutoAnswers_OnSimilarityMatch verifies that a question is answered
+// automatically when a sufficiently similar learned answer exists.
+func TestHandleMessage_AutoAnswers_OnSimilarityMatch(t *testing.T) {
+	learned := &domain.LearnedAnswer{
+		ID:           1,
+		QuestionText: "What is the salary range?",
+		AnswerText:   "The salary is around 150k.",
+	}
+	db := &mockDB{
+		booked:        map[int]bool{},
+		similarAnswer: learned,
+	}
+	topic := "salary"
+	llm := &mockLLM{intent: &domain.Intent{Intent: "question", Confidence: 0.9, QuestionTopic: &topic}}
+	tg := &mockTG{}
+	embedder := &mockEmbedder{embedding: []float32{0.1, 0.2, 0.3}}
+	h := application.NewHandler(db, llm, tg, 999).WithEmbedder(embedder, 0.85)
+
+	msg := &domain.TelegramMessage{
+		From: &domain.TelegramUser{ID: 1},
+		Chat: domain.TelegramChat{ID: 1},
+		Text: "What's the salary range?",
+	}
+	h.HandleMessage(context.Background(), msg)
+
+	// Exactly one message sent: the auto-answer (no escalation).
+	if len(tg.sent) != 1 {
+		t.Fatalf("expected 1 message (auto-answer), got %d", len(tg.sent))
+	}
+	if tg.sent[0].chatID != 1 {
+		t.Errorf("expected message to recruiter (1), got chatID=%d", tg.sent[0].chatID)
+	}
+	if tg.sent[0].text != "The salary is around 150k." {
+		t.Errorf("unexpected auto-answer text: %s", tg.sent[0].text)
+	}
+}
+
+// TestHandleMessage_NoAutoAnswer_BelowThreshold verifies that escalation happens normally
+// when no similar answer is found (FindSimilarAnswer returns nil).
+func TestHandleMessage_NoAutoAnswer_BelowThreshold(t *testing.T) {
+	db := &mockDB{
+		booked:        map[int]bool{},
+		similarAnswer: nil, // nothing in the learned store
+	}
+	topic := "salary"
+	llm := &mockLLM{intent: &domain.Intent{Intent: "question", Confidence: 0.9, QuestionTopic: &topic}}
+	tg := &mockTG{}
+	embedder := &mockEmbedder{embedding: []float32{0.1, 0.2, 0.3}}
+	h := application.NewHandler(db, llm, tg, 999).WithEmbedder(embedder, 0.85)
+
+	msg := &domain.TelegramMessage{
+		From: &domain.TelegramUser{ID: 1},
+		Chat: domain.TelegramChat{ID: 1},
+		Text: "What's the salary range?",
+	}
+	h.HandleMessage(context.Background(), msg)
+
+	// Should escalate: forward to admin (999) + notice to recruiter.
+	if len(tg.sent) < 2 {
+		t.Fatalf("expected 2 messages (escalation), got %d", len(tg.sent))
+	}
+	if tg.sent[0].chatID != 999 {
+		t.Errorf("expected first message to admin (999), got chatID=%d", tg.sent[0].chatID)
 	}
 }
